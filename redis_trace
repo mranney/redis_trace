@@ -264,6 +264,9 @@ function on_tcp_session(tcp_session) {
         tcp_session.on("syn retry", function (session) {
             console.log(format_line_start(session, true) + " SYN retry");
         });
+        tcp_session.on("end", function (session) {
+            console.log("Set stats for session: ", session.session_stats());
+        });
     }
 }
 
