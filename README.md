@@ -2,6 +2,8 @@
 
 Decode redis protocol from packet capture to better understand who is using your redis server and what they are doing with it.
 
+Install with: `npm -g install redis_trace`
+
 ## Example
 
 ```
