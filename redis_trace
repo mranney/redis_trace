@@ -1,0 +1,281 @@
+#!/usr/bin/env node
+
+var inspect = require("util").inspect;
+var pcap = require("pcap");
+var pcap_session, ANSI, options = {};
+var ANSI = require("./ansi");
+var ReplyParser = require("./redis_parser").ReplyParser;
+var Queue = require("./queue");
+
+function lpad(num, len) {
+    var str = num.toString();
+
+    while (str.length < len) {
+        str = "0" + str;
+    }
+    return str;
+}
+
+function format_timestamp(timems) {
+    var date_obj = new Date(timems);
+
+    return ANSI.blue(lpad(date_obj.getHours(), 2) + ":" + lpad(date_obj.getMinutes(), 2) + ":" + lpad(date_obj.getSeconds(), 2) + "." +
+        lpad(date_obj.getMilliseconds(), 3));
+}
+
+function format_hostname(hostname) {
+    if (/[a-zA-Z]/.test(hostname)) {
+        var parts = hostname.split(":");
+        return ANSI.magenta(parts[0].slice(0, 20) + ":" + parts[1]);
+    } else {
+        return ANSI.magenta(hostname);
+    }
+}
+
+function format_line_start(session, send) {
+    if (send) {
+        return format_timestamp(session.current_cap_time) + " " + format_hostname(session.src_name) + " -> " + format_hostname(session.dst_name);
+    }
+    return format_timestamp(session.current_cap_time) + " " + format_hostname(session.dst_name) + " -> " + format_hostname(session.src_name);
+}
+
+function usage_die(message) {
+    if (message) {
+        console.error("");
+        console.error(message);
+    }
+    console.error("");
+    console.error("usage: redis_trace [options]");
+    console.error("");
+    console.error("Capture options:");
+    console.error("    -i <interface>           interface name for capture (def: first with an addr)");
+    console.error("    -f <pcap_filter>         packet filter in pcap-filter(7) syntax (def: all TCP packets)");
+    console.error("    -b <buffer>              size in MB to buffer between libpcap and app (def: 10)");
+    console.error("");
+    process.exit(1);
+}
+
+function parse_options() {
+    var argv_slice = process.argv.slice(2), 
+        optnum = 0, opt, optname,
+        state = "match optname", matches,
+        valid_options;
+
+    valid_options = {
+        "i": { multiple: false, has_value: true },
+        "f": { multiple: false, has_value: true },
+        "b": { multiple: false, has_value: true },
+        "tcp-verbose": { multiple: false, has_value: false },
+        "no-color": { multiple: false, has_value: false },
+        "help": { multiple: false, has_value: false }
+    };
+
+    function set_option(name, value) {
+        if (valid_options[name].multiple) {
+            if (valid_options[name].regex) {
+                value = new RegExp(value);
+            }
+            if (options[name] === undefined) {
+                options[name] = [value];
+            } else {
+                options[name].push(value);
+            }
+        } else {
+            if (options[name] === undefined) {
+                options[name] = value;
+            } else {
+                usage_die("Option " + name + " may only be specified once.");
+            }
+        }
+    }
+
+    while (optnum < argv_slice.length) {
+        opt = argv_slice[optnum];
+        
+        if (state === "match optname") {
+            matches = opt.match(/^[\-]{1,2}([^\-].*)/);
+            if (matches !== null) {
+                optname = matches[1];
+                if (valid_options[optname]) { // if this is a known option
+                    if (valid_options[optname].has_value) {
+                        state = "match optval";
+                    } else {
+                        set_option(optname, true);
+                    }
+                } else {
+                    usage_die("Invalid option name: " + optname);
+                }
+            } else {
+                usage_die("bad option name: " + opt);
+            }
+        } else if (state === "match optval") {
+            if (opt[0] !== "-") {
+                set_option(optname, opt);
+                state = "match optname";
+            } else {
+                usage_die("bad option value: " + opt);
+            }
+        } else {
+            throw new Error("Unknown state " + state + " in options parser");
+        }
+        
+        optnum += 1;
+    }
+    if (state === "match optval") {
+        usage_die("Missing option value for " + optname);
+    }
+}
+
+function privs_check() {
+    if (process.getuid() !== 0) {
+        console.log(ANSI.bold(ANSI.red("Warning: not running with root privs, which are usually required for raw packet capture.")));
+        console.log(ANSI.red("Trying to open anyway..."));
+    }
+}
+
+function start_capture_session() {
+    if (! options.f) {
+        // default filter is all IPv4 TCP, which is all we know how to decode right now anyway
+        options.f = "ip proto \\tcp and port 6379";
+    }
+    pcap_session = pcap.createSession(options.i, options.f, (options.b * 1024 * 1024));
+    console.log("Listening on " + pcap_session.device_name);
+}
+
+function start_drop_watcher() {
+    // Check for pcap dropped packets on an interval
+    var first_drop = setInterval(function () {
+        var stats = pcap_session.stats();
+        if (stats.ps_drop > 0) {
+            console.log(ANSI.bold("pcap dropped packets, need larger buffer or less work to do: " + JSON.stringify(stats)));
+            clearInterval(first_drop);
+            setInterval(function () {
+                console.log(ANSI.bold("pcap dropped packets: " + JSON.stringify(stats)));
+            }, 5000);
+        }
+    }, 1000);
+}
+
+function setup_listeners() {
+    var tcp_tracker = new pcap.TCPTracker();
+
+    pcap_session.on("packet", function (raw_packet) {
+        var packet = pcap.decode.packet(raw_packet);
+        tcp_tracker.track_packet(packet);
+    });
+
+    // tracker emits sessions, and sessions emit data
+    tcp_tracker.on("session", function (tcp_session) {
+        on_tcp_session(tcp_session);
+    });
+}
+
+function format_req(req) {
+    var ret = ANSI.green(req[0]);
+    if (req.length > 1) {
+        ret += " [" + req.slice(1).join(", ") + "]";
+    }
+    return ret;
+}
+
+function format_res(res) {
+    if (Array.isArray(res)) {
+        return ANSI.cyan("[" + res.join(", ") + "]");
+    }
+    if (typeof res === "string") {
+        return ANSI.cyan(res);
+    }
+    return ANSI.cyan(inspect(res));
+}
+
+function format_sub(res) {
+    return ANSI.green(res[0]) + " " + ANSI.cyan("[" + res.slice(1).join(", ") + "]");
+}
+
+var total_ops = 0;
+
+function RedisReq(req, start) {
+    this.req = req;
+    this.start = start;
+}
+
+function on_tcp_session(tcp_session) {
+    var req_parser = new ReplyParser({});
+    var res_parser = new ReplyParser({});
+    var command_queue = new Queue();
+    var session_start = tcp_session.current_cap_time;
+    var command_count = 0;
+
+    if (tcp_session.missed_syn) {
+        console.log(format_line_start(tcp_session, true) + " TCP already in progress ");
+    } else {
+        console.log(format_line_start(tcp_session, true) + " TCP start ");
+    }
+
+    tcp_session.on("data send", function (session, chunk) {
+        req_parser.execute(chunk);
+    });
+    tcp_session.on("data recv", function (session, chunk) {
+        res_parser.execute(chunk);
+    });
+    tcp_session.on("end", function (session) {
+        var dur = (session.current_cap_time - session_start).toFixed(3);
+        console.log(format_line_start(session, true) + " TCP end " + dur + "s " + command_count + " commands " +
+            (command_count/dur).toFixed(2) + " req/sec");
+    });
+
+    req_parser.on("reply", function (req) {
+        command_queue.push(new RedisReq(req, tcp_session.current_cap_time));
+        command_count++;
+        total_ops++;
+    });
+    req_parser.on("error", function (err) {
+        console.log("Got req error: ", err);
+    });
+
+    // Change this function to do other types of analysis
+    res_parser.on("reply", function (reply) {
+        var req = command_queue.shift();
+        if (!req) {
+            if (Array.isArray(reply) && (reply[0] === "message" || reply[0] === "pmessage")) {
+                console.log(format_line_start(tcp_session) + " " + format_sub(reply));
+            } else {
+                console.log(format_line_start(tcp_session) + " reply with no req: " + format_res(reply));
+            }
+            return;
+        }
+        var duration = ((tcp_session.current_cap_time - req.start) * 1000).toFixed(3);
+        console.log(format_line_start(tcp_session) + " " + command_count + "/" + total_ops + " " + format_req(req.req) + " -> " +
+            format_res(reply) + " " + duration + "ms");
+    });
+
+    res_parser.on("error", function (err) {
+        console.log("Got reply error: ", err);
+    });
+
+    if (options["tcp-verbose"]) {
+        tcp_session.on("retransmit", function (session, direction, seqno) {
+            console.log(format_line_start(session, direction === "send") + " TCP retransmit at " + seqno);
+        });
+        tcp_session.on("reset", function (session) {
+            // eventually this event will have a direction.  Right now, it's only from dst.
+            console.log(format_line_start(session, false) + " TCP reset ");
+        });
+        tcp_session.on("syn retry", function (session) {
+            console.log(format_line_start(session, true) + " SYN retry");
+        });
+    }
+}
+
+// Make it all go
+parse_options();
+if (options["no-color"]) {
+    ANSI.no_color = true;
+}
+if (options.help) {
+    usage_die();
+}
+privs_check();
+start_capture_session();
+start_drop_watcher();
+setup_listeners();

@@ -1,0 +1,16 @@
+{   "name" : "redis_trace",
+    "version" : "1.0.0",
+    "description" : "Live Redis packet capture and protocol decoding",
+    "author": "Matt Ranney <mjr@ranney.com>",
+    "main": "./redis_trace",
+    "repository": {
+        "type": "git",
+        "url": "git://github.com/mranney/redis_trace.git"
+    },
+    "dependencies": {
+        "pcap": ">=2.0.0"
+    },
+    "bin": {
+        "redis_trace": "./redis_trace"
+    }
+}
